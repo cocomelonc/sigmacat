@@ -29,11 +29,13 @@ $$
 \mathrm{SNR}(A) = \mathrm{SNR}_\mathrm{peak} + 20\log_{10}\!\left(\frac{A}{A_\mathrm{FS}}\right)
 $$
 
-how to build:      
+how to compile (libc + libm only):       
 
 ```bash
-make            # cc -O2 -o sigmacat sigmacat.c -lm  (libc + libm only)
+gcc -O2 -Wall -Wextra -std=c11 -o sigmacat sigmacat.c -lm
 ```
+
+![img](./img/2026-09-22_22-08.png)     
 
 run
 
@@ -42,8 +44,13 @@ sudo ./sigmacat                 # read /sys/firmware/acpi/tables/NHLT (root)
 ./sigmacat --raw dump.bin       # raw binary nhlt blob
 ./sigmacat --hex /tmp/nhlt.hex  # an `xxd` hexdump
 ./sigmacat --demo               # no hardware: model a 48k/16-bit dmic
+./sigmacat --viz                # live spectrum of the synthetic model
+./sigmacat --wav rec.wav        # live spectrum + descriptors of real audio
+./sigmacat --scan dir/          # scan a dataset of .wav files
 ./sigmacat ... --pdm-clock 3072000
 ```
+
+![img](./img/2026-09-22_22-26.png)     
 
 original firmware-forensics flow:     
 
@@ -51,6 +58,8 @@ original firmware-forensics flow:
 sudo xxd /sys/firmware/acpi/tables/NHLT > /tmp/nhlt.hex
 ./sigmacat --hex /tmp/nhlt.hex
 ```
+
+![img](./img/2026-09-22_22-24.png)     
 
 ## simulation vs. theory
 
@@ -65,6 +74,35 @@ for a 48 kHz / OSR 64 DMIC at $A/A_\mathrm{FS}=0.5$ (−6 dBFS):
 Hann windowing + Welch averaging pulled the measured SNR from ~59 dB (single rectangular DFT, dominated by spectral leakage and periodogram variance) to within ~4 dB of the input-scaled theory. the residual is genuine, not a measurement artifact: the sinc³ CIC decimator folds a little out-of-band shaped noise back in-band and droops the passband. matching the decimator order to the modulator ($L{+}1$ stages) and adding droop compensation is the next DSP step.
 
 LinkType codes: `0` hd-audio, `1` dsp, `2` *pdm/dmic*, `3` ssp/i2s, `4` slimbus, `5` soundwire.
+
+## real data & datasets
+
+the same DSP core runs on real recordings, closing the loop: NHLT says a DMIC
+exists → capture from it → look at what it actually produces. capture the raw
+PDM-backed endpoint (or the default mic) with ALSA, then analyze:
+
+```bash
+arecord -D hw:0,6 -f S32_LE -r 48000 -c 2 -d 5 dmic.wav   # card 0, device 6 = "DMIC Raw"
+./sigmacat --wav dmic.wav                                  # live welch spectrum + descriptors
+./sigmacat --scan ~/recordings                             # whole folder -> metrics table
+```
+
+`--wav` reads 16-/32-bit PCM (and float) WAVs directly (own RIFF parser, no
+libsndfile), downmixes to mono, and animates a Hann-windowed **Welch periodogram**
+of the real signal, reporting per-capture descriptors:
+
+| descriptor | meaning |
+|---|---|
+| dominant / centroid | spectral peak and centre of mass (analysis band 50 Hz–fs/2) |
+| rms (dBFS) / crest | level and peak-to-rms ratio of the capture |
+| noise floor | median bin below the peak |
+| spectral flatness | geometric/arithmetic mean ratio - `tonal` vs `noise-like` |
+
+`--scan <dir>` runs that analysis over a **dataset** of `.wav` files and prints
+one descriptor row per file plus aggregate means - useful to triage a batch of
+captures at a glance (e.g. silent/dead DMIC captures fall out immediately as
+`rms ≈ -120 dBFS`, flatness `0`, while voiced speech reads `flatness ≈ -30 dB,
+tonal`).
 
 ## references
 
