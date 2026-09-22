@@ -109,36 +109,81 @@ static double sd_theory_snr(double osr, int order, int nbits) {
   return 6.02 * nbits + 1.76 + shape + gain;
 }
 
-/* single-bin dft power (goertzel-style) at normalized bin k of n. */
-static double bin_power(const double *x, int n, int k) {
-  double w = 2.0 * M_PI * k / n, re = 0.0, im = 0.0;
-  for (int i = 0; i < n; i++) { re += x[i] * cos(w * i); im -= x[i] * sin(w * i); }
-  return re * re + im * im;
+/* input sine amplitude relative to the +-1 quantizer full scale. kept below
+ * full scale so the 1-bit 2nd-order loop stays stable; the resulting input
+ * backoff (in db) is applied to the theory so the two are compared fairly. */
+#define SD_INPUT_AMP 0.5
+
+/* iterative radix-2 cooley-tukey fft, in place; n must be a power of two.
+ * re[]/im[] hold the complex signal on entry and its spectrum on return. */
+static void fft(double *re, double *im, int n) {
+  /* bit-reversal permutation */
+  for (int i = 1, j = 0; i < n; i++) {
+    int bit = n >> 1;
+    for (; j & bit; bit >>= 1) j ^= bit;
+    j ^= bit;
+    if (i < j) {
+      double tr = re[i]; re[i] = re[j]; re[j] = tr;
+      double ti = im[i]; im[i] = im[j]; im[j] = ti;
+    }
+  }
+  /* butterflies */
+  for (int len = 2; len <= n; len <<= 1) {
+    double ang = -2.0 * M_PI / len, wr = cos(ang), wi = sin(ang);
+    for (int i = 0; i < n; i += len) {
+      double cr = 1.0, ci = 0.0;
+      for (int k = 0; k < len / 2; k++) {
+        int a = i + k, b = a + len / 2;
+        double tr = re[b] * cr - im[b] * ci;
+        double ti = re[b] * ci + im[b] * cr;
+        re[b] = re[a] - tr; im[b] = im[a] - ti;
+        re[a] += tr;        im[a] += ti;
+        double ncr = cr * wr - ci * wi;
+        ci = cr * wi + ci * wr; cr = ncr;
+      }
+    }
+  }
 }
 
 /* simulate a 2nd-order 1-bit modulator on a pure tone, decimate with a
- * sinc^3 (cic) filter, then measure snr with the single-bin dft. returns
- * measured snr in db; writes the tone frequency and clamped osr back out. */
+ * sinc^3 (cic) filter, then estimate in-band snr with welch's method:
+ * 50%-overlapping hann-windowed segments whose periodograms are averaged.
+ * the averaging kills the variance that made a single rectangular dft read
+ * ~25 db low. returns measured snr in db; writes tone freq and clamped osr. */
 static double sd_simulate(int osr, double f_pcm, double *tone_hz_out, int *osr_out) {
   if (osr < 8)  osr = 8;         /* keep the run small and stable */
   if (osr > 64) osr = 64;
   *osr_out = osr;
 
-  const int n_pcm = 4096, n_pdm = n_pcm * osr, tone_k = 60;
+  const int seg = 4096;          /* fft / welch segment length (power of 2) */
+  const int n_seg = 32;          /* number of 50%-overlap segments to average */
+  const int tone_k = 127;        /* signal bin: on-grid so no scalloping loss */
+  const int guard = 3;           /* bins each side of the tone (hann mainlobe) */
+  const int warm = seg;          /* discard modulator/cic startup transient */
+
+  int n_pcm = warm + seg + (n_seg - 1) * (seg / 2);
+  long n_pdm = (long)n_pcm * osr;
   double f_pdm = f_pcm * osr;
-  double tone_hz = (double)tone_k / n_pcm * f_pcm;
+  double tone_hz = (double)tone_k / seg * f_pcm;
   *tone_hz_out = tone_hz;
 
   double *pdm = malloc((size_t)n_pdm * sizeof(double));
   double *a   = malloc((size_t)n_pdm * sizeof(double));
   double *b   = malloc((size_t)n_pdm * sizeof(double));
   double *pcm = malloc((size_t)n_pcm * sizeof(double));
-  if (!pdm || !a || !b || !pcm) { free(pdm); free(a); free(b); free(pcm); return 0.0; }
+  double *re  = malloc((size_t)seg   * sizeof(double));
+  double *im  = malloc((size_t)seg   * sizeof(double));
+  double *psd = calloc((size_t)seg / 2, sizeof(double));
+  double *win = malloc((size_t)seg   * sizeof(double));
+  if (!pdm || !a || !b || !pcm || !re || !im || !psd || !win) {
+    free(pdm); free(a); free(b); free(pcm); free(re); free(im); free(psd); free(win);
+    return 0.0;
+  }
 
   /* 2nd-order modulator: two integrators, 1-bit quantizer in the loop. */
-  double i1 = 0.0, i2 = 0.0, y = 0.0, amp = 0.4;
-  for (int n = 0; n < n_pdm; n++) {
-    double x = amp * sin(2.0 * M_PI * tone_hz * n / f_pdm);
+  double i1 = 0.0, i2 = 0.0, y = 0.0;
+  for (long n = 0; n < n_pdm; n++) {
+    double x = SD_INPUT_AMP * sin(2.0 * M_PI * tone_hz * n / f_pdm);
     i1 += x - y;
     i2 += i1 - y;
     y = (i2 >= 0.0) ? 1.0 : -1.0;
@@ -149,26 +194,36 @@ static double sd_simulate(int osr, double f_pcm, double *tone_hz_out, int *osr_o
   memcpy(a, pdm, (size_t)n_pdm * sizeof(double));
   for (int s = 0; s < 3; s++) {
     double acc = 0.0;
-    for (int i = 0; i < n_pdm; i++) {
+    for (long i = 0; i < n_pdm; i++) {
       acc += a[i];
       if (i >= osr) acc -= a[i - osr];
       b[i] = acc / osr;
     }
     double *t = a; a = b; b = t;
   }
-  for (int i = 0; i < n_pcm; i++) pcm[i] = a[(i + 1) * osr - 1];
+  for (int i = 0; i < n_pcm; i++) pcm[i] = a[(long)(i + 1) * osr - 1];
 
-  /* strip dc, then signal-bin vs in-band noise. */
-  double mean = 0.0;
-  for (int i = 0; i < n_pcm; i++) mean += pcm[i];
-  mean /= n_pcm;
-  for (int i = 0; i < n_pcm; i++) pcm[i] -= mean;
+  /* hann window (periodic form matches welch overlap-add analysis). */
+  for (int i = 0; i < seg; i++)
+    win[i] = 0.5 - 0.5 * cos(2.0 * M_PI * i / seg);
 
-  double sig = bin_power(pcm, n_pcm, tone_k), noise = 0.0;
-  for (int k = 1; k < n_pcm / 2; k++)
-    if (k != tone_k) noise += bin_power(pcm, n_pcm, k);
+  /* accumulate windowed periodograms over overlapping segments. */
+  for (int s = 0; s < n_seg; s++) {
+    int start = warm + s * (seg / 2);
+    for (int i = 0; i < seg; i++) { re[i] = pcm[start + i] * win[i]; im[i] = 0.0; }
+    fft(re, im, seg);
+    for (int k = 0; k < seg / 2; k++) psd[k] += re[k] * re[k] + im[k] * im[k];
+  }
 
-  free(pdm); free(a); free(b); free(pcm);
+  /* signal = tone bins +- guard; noise = the rest of the in-band spectrum
+   * (skip dc bin 0, which the window leaves any residual mean in). */
+  double sig = 0.0, noise = 0.0;
+  for (int k = 1; k < seg / 2; k++) {
+    if (k >= tone_k - guard && k <= tone_k + guard) sig += psd[k];
+    else noise += psd[k];
+  }
+
+  free(pdm); free(a); free(b); free(pcm); free(re); free(im); free(psd); free(win);
   return noise > 0.0 ? 10.0 * log10(sig / noise) : 0.0;
 }
 
@@ -177,20 +232,26 @@ static void model_dmic(uint32_t f_pcm, uint16_t bits, double f_pdm) {
   double osr = f_pdm / f_pcm;
   int order = 2;              /* typical low-order dmic loop */
 
-  double snr_th = sd_theory_snr(osr, order, 1);
-  double enob_th = (snr_th - 1.76) / 6.02;
+  /* full-scale peak snr, then the same theory scaled to the input level the
+   * simulation actually drives (the quantization noise floor is set by the
+   * modulator/osr, so snr tracks input level db-for-db). */
+  double backoff = 20.0 * log10(SD_INPUT_AMP);
+  double snr_fs  = sd_theory_snr(osr, order, 1);
+  double snr_adj = snr_fs + backoff;
 
   double tone_hz; int osr_sim;
   double snr_sim = sd_simulate((int)lround(osr), f_pcm, &tone_hz, &osr_sim);
-  double enob_sim = (snr_sim - 1.76) / 6.02;
 
   printf("  sigma-delta model (order l=%d, 1-bit quantizer):\n", order);
-  printf("    pcm rate   : %u hz  (%u-bit)\n", f_pcm, bits);
-  printf("    pdm clock  : %.0f hz\n", f_pdm);
-  printf("    osr      : %.0f  (f_pdm / f_pcm)\n", osr);
-  printf("    theory  snr  : %6.1f db   -> enob %.1f bits\n", snr_th, enob_th);
-  printf("    sim   snr  : %6.1f db   -> enob %.1f bits (osr=%d, tone %.0f hz)\n",
-       snr_sim, enob_sim, osr_sim, tone_hz);
+  printf("    pcm rate            : %u hz  (%u-bit)\n", f_pcm, bits);
+  printf("    pdm clock           : %.0f hz\n", f_pdm);
+  printf("    osr                 : %.0f  (f_pdm / f_pcm)\n", osr);
+  printf("    theory (full-scale) : %6.1f db   -> enob %.1f bits\n",
+         snr_fs, (snr_fs - 1.76) / 6.02);
+  printf("    theory (@ %.1f dbfs): %6.1f db   -> enob %.1f bits\n",
+         backoff, snr_adj, (snr_adj - 1.76) / 6.02);
+  printf("    sim (hann+welch)    : %6.1f db   -> enob %.1f bits (osr=%d, tone %.0f hz)\n",
+         snr_sim, (snr_sim - 1.76) / 6.02, osr_sim, tone_hz);
 }
 
 /* =======================================================================

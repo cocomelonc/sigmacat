@@ -1,7 +1,5 @@
 # sigmacat
 
-`author: cocomelonc`
-
 single-file C tool that parses the ACPI *NHLT* (Non-HDA Link Table), reports every audio endpoint, and flags digital microphones - plus the math behind what a DMIC actually is.
 
 ## what it does
@@ -23,7 +21,13 @@ $$
 \mathrm{ENOB} = \frac{\mathrm{SNR}_\mathrm{dB} - 1.76}{6.02}
 $$
 
-- a **live time-domain simulation**: a 2nd-order 1-bit modulator on a test tone $\rightarrow$ sinc³ (CIC) decimator $\rightarrow$ single-bin DFT that measures the real SNR and confirms the analytical number.
+- a *live time-domain simulation*: a 2nd-order 1-bit modulator on a test tone $\rightarrow$ sinc³ (CIC) decimator $\rightarrow$ *Welch-averaged, Hann-windowed periodogram* (radix-2 FFT) that measures the real in-band SNR and confirms the analytical number.
+
+because the 1-bit loop must run below full scale to stay stable, the peak-SNR theory is also reported scaled by the input backoff $20\log_{10}(A/A_\mathrm{FS})$ - the ΔΣ noise floor is set by the modulator/OSR, not the signal, so SNR tracks input level dB-for-dB:
+
+$$
+\mathrm{SNR}(A) = \mathrm{SNR}_\mathrm{peak} + 20\log_{10}\!\left(\frac{A}{A_\mathrm{FS}}\right)
+$$
 
 how to build:      
 
@@ -48,8 +52,38 @@ sudo xxd /sys/firmware/acpi/tables/NHLT > /tmp/nhlt.hex
 ./sigmacat --hex /tmp/nhlt.hex
 ```
 
-## notes
+## simulation vs. theory
 
-the analytical SNR is the *ideal* peak; the built-in simulation runs a deliberately simple 2nd-order loop with a rectangular-window DFT, so its measured SNR sits below theory (window leakage + non-ideal decimation). the gap is expected and is where the deeper DSP pass + live visualization go next.     
+for a 48 kHz / OSR 64 DMIC at $A/A_\mathrm{FS}=0.5$ (−6 dBFS):
+
+| quantity | value |
+|---|---|
+| theory, full-scale peak | ≈ 85.2 dB (ENOB ≈ 13.9) |
+| theory, at −6 dBFS input | ≈ 79.2 dB (ENOB ≈ 12.9) |
+| simulation (Hann + Welch) | ≈ 74.9 dB (ENOB ≈ 12.2) |
+
+Hann windowing + Welch averaging pulled the measured SNR from ~59 dB (single rectangular DFT, dominated by spectral leakage and periodogram variance) to within ~4 dB of the input-scaled theory. the residual is genuine, not a measurement artifact: the sinc³ CIC decimator folds a little out-of-band shaped noise back in-band and droops the passband. matching the decimator order to the modulator ($L{+}1$ stages) and adding droop compensation is the next DSP step.
 
 LinkType codes: `0` hd-audio, `1` dsp, `2` *pdm/dmic*, `3` ssp/i2s, `4` slimbus, `5` soundwire.
+
+## references
+
+the tool is a small implementation of well-established results; the math and the NHLT layout come from:
+
+**NHLT / ACPI table format**
+- Intel, *Smart Sound Technology Audio DSP Non-HD Audio ACPI (NHLT) Specification* (Intel design portal, DocID 595976). The de-facto public reference implementation is the Linux kernel: [`sound/hda/intel-nhlt.c`](https://github.com/torvalds/linux/blob/master/sound/hda/intel-nhlt.c) and [`include/sound/intel-nhlt.h`](https://github.com/torvalds/linux/blob/master/include/sound/intel-nhlt.h).
+- UEFI Forum, *ACPI Specification* (system description table header layout) - https://uefi.org/specifications
+
+**Sigma-delta modulation & the peak-SNR formula**
+- P. M. Aziz, H. V. Sorensen, J. Van Der Spiegel, "An overview of sigma-delta converters," *IEEE Signal Processing Magazine*, vol. 13, no. 1, pp. 61–84, 1996. [doi:10.1109/79.482138](https://doi.org/10.1109/79.482138)
+- R. Schreier and G. C. Temes, *Understanding Delta-Sigma Data Converters*, Wiley-IEEE Press, 2005 (ISBN 978-0-471-46585-0) - derivation of $\mathrm{SNR}=6.02N+1.76-10\log_{10}\frac{\pi^{2L}}{2L+1}+(20L+10)\log_{10}\mathrm{OSR}$.
+- J. C. Candy and G. C. Temes (eds.), *Oversampling Delta-Sigma Data Converters: Theory, Design, and Simulation*, IEEE Press, 1992 (ISBN 0-87942-285-8).
+
+**Decimation (the sinc³ / CIC filter)**
+- E. B. Hogenauer, "An economical class of digital filters for decimation and interpolation," *IEEE Trans. Acoust., Speech, Signal Process.*, vol. 29, no. 2, pp. 155–162, 1981. [doi:10.1109/TASSP.1981.1163535](https://doi.org/10.1109/TASSP.1981.1163535)
+- J. C. Candy, "Decimation for sigma delta modulation," *IEEE Trans. Commun.*, vol. 34, no. 1, pp. 72–76, 1986. [doi:10.1109/TCOM.1986.1096432](https://doi.org/10.1109/TCOM.1986.1096432)
+
+**Spectral estimation (FFT, Welch, windows)**
+- J. W. Cooley and J. W. Tukey, "An algorithm for the machine calculation of complex Fourier series," *Math. Comp.*, vol. 19, pp. 297–301, 1965. [doi:10.1090/S0025-5718-1965-0178586-1](https://doi.org/10.1090/S0025-5718-1965-0178586-1)
+- P. D. Welch, "The use of fast Fourier transform for the estimation of power spectra: a method based on time averaging over short, modified periodograms," *IEEE Trans. Audio Electroacoust.*, vol. 15, no. 2, pp. 70–73, 1967. [doi:10.1109/TAU.1967.1161901](https://doi.org/10.1109/TAU.1967.1161901)
+- F. J. Harris, "On the use of windows for harmonic analysis with the discrete Fourier transform," *Proc. IEEE*, vol. 66, no. 1, pp. 51–83, 1978. [doi:10.1109/PROC.1978.10837](https://doi.org/10.1109/PROC.1978.10837)
